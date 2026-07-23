@@ -2,3 +2,6 @@ pandas
 matplotlib
 plotly
 streamlit
+google-cloud-bigquery
+db-dtypes
+statsmodels

@@ -1,15 +1,21 @@
 """고객은 왜 이탈하는가 — 이탈 원인 진단 대시보드"""
 import os
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+from google.cloud import bigquery
+from plotly.subplots import make_subplots
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 REF_DATE = pd.Timestamp("2024-12-31")
+
+BQ_PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "project-9eedbe22-48b2-44eb-afd")
+BQ_DATASET = "data_agents"
 
 
 @st.cache_data
@@ -35,6 +41,53 @@ def load_satisfaction() -> pd.DataFrame:
 @st.cache_data
 def load_usage() -> pd.DataFrame:
     return pd.read_csv(os.path.join(DATA_DIR, "data_usage_history.csv"))
+
+
+@st.cache_resource
+def get_bigquery_client() -> bigquery.Client:
+    return bigquery.Client(project=BQ_PROJECT_ID)
+
+
+@st.cache_data(ttl=3600)
+def load_agent_metrics() -> pd.DataFrame:
+    """agents·consultations·satisfaction을 조인해 상담원 단위 지표를 직접 재계산."""
+    client = get_bigquery_client()
+    query = f"""
+        WITH agent_csat AS (
+            SELECT
+                a.agent_id, a.team, a.overtime_hours_avg,
+                a.agent_satisfaction, a.training_completed_yn,
+                AVG(s.csat) AS avg_csat
+            FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.agents` a
+            JOIN `{BQ_PROJECT_ID}.{BQ_DATASET}.consultations` c ON a.agent_id = c.agent_id
+            JOIN `{BQ_PROJECT_ID}.{BQ_DATASET}.satisfaction` s ON c.consult_id = s.consult_id
+            GROUP BY a.agent_id, a.team, a.overtime_hours_avg, a.agent_satisfaction, a.training_completed_yn
+        ),
+        agent_recontact AS (
+            SELECT a.agent_id, AVG(CAST(c.is_recontact AS INT64)) AS recontact_rate
+            FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.agents` a
+            JOIN `{BQ_PROJECT_ID}.{BQ_DATASET}.consultations` c ON a.agent_id = c.agent_id
+            GROUP BY a.agent_id
+        )
+        SELECT ac.*, ar.recontact_rate
+        FROM agent_csat ac
+        JOIN agent_recontact ar ON ac.agent_id = ar.agent_id
+    """
+    df = client.query(query).to_dataframe()
+    # BigQuery INT64 컬럼은 pandas nullable Int64로 오는데, 이 타입의 to_numpy()는
+    # object dtype 배열이 되어 np.corrcoef/np.polyfit이 깨진다 → 표준 float64로 변환
+    df["overtime_hours_avg"] = df["overtime_hours_avg"].astype("float64")
+    df["agent_satisfaction"] = df["agent_satisfaction"].astype("float64")
+    return df
+
+
+def calc_enps(scores: pd.Series) -> float:
+    n = len(scores)
+    if n == 0:
+        return float("nan")
+    promoter = (scores >= 9).sum()
+    detractor = (scores <= 6).sum()
+    return (promoter / n - detractor / n) * 100
 
 
 def build_voc_chart(customers: pd.DataFrame, voc: pd.DataFrame) -> go.Figure:
@@ -357,3 +410,221 @@ st.plotly_chart(build_region_chart(customers), use_container_width=True)
 
 st.subheader("⑥ 가입기간·이용량으로 본 이탈")
 st.plotly_chart(build_tenure_usage_scatter(customers, usage), use_container_width=True)
+
+st.subheader("상담원 관점: 직원만족도와 고객 경험")
+
+try:
+    agent_metrics = load_agent_metrics()
+except Exception as exc:  # BigQuery 인증/연결 실패 시 나머지 대시보드는 계속 동작
+    st.warning(f"BigQuery 연결에 실패해 이 섹션을 표시할 수 없습니다: {exc}")
+else:
+    team_options = ["전체", "1팀", "2팀", "3팀"]
+    selected_team = st.selectbox("팀 선택", team_options, key="agent_team_select")
+
+    # selectbox 값이 바뀌면 app.py가 처음부터 재실행되고, 선택된 팀으로 아래가 새로 계산·렌더링됨
+    if selected_team == "전체":
+        filtered = agent_metrics
+    else:
+        filtered = agent_metrics[agent_metrics["team"] == selected_team]
+
+    GAUGE_RED, GAUGE_RED_LIGHT = "#e34948", "#f6c9c8"
+    GAUGE_NEUTRAL, GAUGE_BLUE_LIGHT = "#f0efec", "#cde2fb"
+    STATUS_GOOD, STATUS_CRITICAL = "#0ca30c", "#d03b3b"
+    INK, MUTED, BORDER, BLUE = "#0b0b0b", "#898781", "#c3c2b7", "#2a78d6"
+
+    # --- 07_plotly_직원만족도eNPS스코어카드 로직: 큰 게이지 + 팀별 카드 ---
+    enps_selected = calc_enps(filtered["agent_satisfaction"])
+    fig_enps = go.Figure()
+    fig_enps.add_trace(
+        go.Indicator(
+            mode="gauge+number",
+            value=enps_selected,
+            number={"font": {"size": 40, "color": INK}},
+            title={"text": f"{selected_team} eNPS", "font": {"size": 18, "color": INK}},
+            domain={"x": [0, 0.52], "y": [0, 1]},
+            gauge={
+                "axis": {"range": [-100, 100], "tickwidth": 1, "tickcolor": MUTED},
+                "bar": {"color": INK, "thickness": 0.3},
+                "bgcolor": "white",
+                "borderwidth": 1,
+                "bordercolor": BORDER,
+                "steps": [
+                    {"range": [-100, -50], "color": GAUGE_RED},
+                    {"range": [-50, 0], "color": GAUGE_RED_LIGHT},
+                    {"range": [0, 50], "color": GAUGE_NEUTRAL},
+                    {"range": [50, 100], "color": GAUGE_BLUE_LIGHT},
+                ],
+                "threshold": {"line": {"color": INK, "width": 3}, "thickness": 0.75, "value": 0},
+            },
+        )
+    )
+    card_domains = [[0.58, 0.71], [0.735, 0.865], [0.89, 1.0]]
+    for team_name, x_range in zip(["1팀", "2팀", "3팀"], card_domains):
+        team_enps = calc_enps(agent_metrics.loc[agent_metrics["team"] == team_name, "agent_satisfaction"])
+        color = STATUS_GOOD if team_enps >= 0 else STATUS_CRITICAL
+        label = f"{team_name} eNPS" + (" ◀ 선택됨" if team_name == selected_team else "")
+        fig_enps.add_trace(
+            go.Indicator(
+                mode="number",
+                value=team_enps,
+                number={"valueformat": ".1f", "font": {"size": 28, "color": color}},
+                title={"text": label, "font": {"size": 13, "color": INK}},
+                domain={"x": x_range, "y": [0.2, 0.8]},
+            )
+        )
+    fig_enps.update_layout(font=dict(family="Malgun Gothic"), height=320, margin=dict(t=60, b=10, l=10, r=10))
+    st.plotly_chart(fig_enps, use_container_width=True)
+
+    # --- 08_plotly_번아웃CSAT산점도 로직: OLS 추세선 + r 주석 ---
+    if len(filtered) >= 2 and filtered["overtime_hours_avg"].nunique() >= 2:
+        r_selected = np.corrcoef(filtered["overtime_hours_avg"].to_numpy(), filtered["avg_csat"].to_numpy())[0, 1]
+        fig_scatter = px.scatter(
+            filtered,
+            x="overtime_hours_avg",
+            y="avg_csat",
+            hover_name="agent_id",
+            trendline="ols",
+            trendline_color_override=INK,
+            title=f"번아웃(초과근무) × CSAT — {selected_team}",
+            labels={"overtime_hours_avg": "월평균 초과근무 시간(h)", "avg_csat": "CSAT 평균"},
+        )
+        fig_scatter.update_traces(
+            marker=dict(size=10, color=BLUE, line=dict(width=1, color="white")),
+            hovertemplate="<b>%{hovertext}</b><br>초과근무: %{x}시간<br>CSAT 평균: %{y:.2f}<extra></extra>",
+            selector=dict(mode="markers"),
+        )
+        fig_scatter.add_annotation(
+            text=f"r = {r_selected:.2f}",
+            xref="paper",
+            yref="paper",
+            x=0.98,
+            y=0.98,
+            showarrow=False,
+            font=dict(size=15, color=INK),
+            bgcolor="rgba(255,255,255,0.7)",
+        )
+        fig_scatter.update_layout(font=dict(family="Malgun Gothic"), plot_bgcolor="white")
+        st.plotly_chart(fig_scatter, use_container_width=True)
+    else:
+        st.caption(f"{selected_team}은 표본이 너무 적어 추세선을 계산할 수 없습니다.")
+
+    # --- 09_plotly_번아웃CSAT이상치비교 로직: 이상치(초과근무 25h+) 포함 vs 제외 ---
+    OUTLIER_THRESHOLD = 25
+    is_outlier = filtered["overtime_hours_avg"] >= OUTLIER_THRESHOLD
+    df_incl, df_excl = filtered, filtered[~is_outlier]
+
+    def fit_ols(df):
+        if len(df) < 2 or df["overtime_hours_avg"].nunique() < 2:
+            return None
+        x, y = df["overtime_hours_avg"].to_numpy(), df["avg_csat"].to_numpy()
+        slope, intercept = np.polyfit(x, y, 1)
+        r = np.corrcoef(x, y)[0, 1]
+        return slope, intercept, r
+
+    fit_incl, fit_excl = fit_ols(df_incl), fit_ols(df_excl)
+
+    if fit_incl and fit_excl:
+        x_range = [0, agent_metrics["overtime_hours_avg"].max() + 3]
+        y_range = [agent_metrics["avg_csat"].min() - 0.1, agent_metrics["avg_csat"].max() + 0.1]
+
+        fig_cmp = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=[f"이상치 포함 (n={len(df_incl)})", f"이상치 제외 (n={len(df_excl)})"],
+            horizontal_spacing=0.08,
+        )
+        fig_cmp.add_trace(
+            go.Scatter(
+                x=df_incl.loc[~is_outlier, "overtime_hours_avg"],
+                y=df_incl.loc[~is_outlier, "avg_csat"],
+                mode="markers",
+                name="일반",
+                marker=dict(size=10, color=BLUE, line=dict(width=1, color="white")),
+                hovertext=df_incl.loc[~is_outlier, "agent_id"],
+                hovertemplate="<b>%{hovertext}</b><br>초과근무: %{x}시간<br>CSAT 평균: %{y:.2f}<extra></extra>",
+                legendgroup="normal",
+            ),
+            row=1,
+            col=1,
+        )
+        if is_outlier.any():
+            fig_cmp.add_trace(
+                go.Scatter(
+                    x=df_incl.loc[is_outlier, "overtime_hours_avg"],
+                    y=df_incl.loc[is_outlier, "avg_csat"],
+                    mode="markers",
+                    name=f"이상치(≥{OUTLIER_THRESHOLD}h)",
+                    marker=dict(size=12, color=GAUGE_RED, symbol="diamond", line=dict(width=1, color="white")),
+                    hovertext=df_incl.loc[is_outlier, "agent_id"],
+                    hovertemplate="<b>%{hovertext}</b><br>초과근무: %{x}시간<br>CSAT 평균: %{y:.2f}<extra></extra>",
+                    legendgroup="outlier",
+                ),
+                row=1,
+                col=1,
+            )
+        trend_x = np.array(x_range)
+        fig_cmp.add_trace(
+            go.Scatter(
+                x=trend_x,
+                y=fit_incl[0] * trend_x + fit_incl[1],
+                mode="lines",
+                line=dict(color=INK, width=2),
+                showlegend=False,
+            ),
+            row=1,
+            col=1,
+        )
+        fig_cmp.add_trace(
+            go.Scatter(
+                x=df_excl["overtime_hours_avg"],
+                y=df_excl["avg_csat"],
+                mode="markers",
+                name="일반",
+                marker=dict(size=10, color=BLUE, line=dict(width=1, color="white")),
+                hovertext=df_excl["agent_id"],
+                hovertemplate="<b>%{hovertext}</b><br>초과근무: %{x}시간<br>CSAT 평균: %{y:.2f}<extra></extra>",
+                legendgroup="normal",
+                showlegend=False,
+            ),
+            row=1,
+            col=2,
+        )
+        fig_cmp.add_trace(
+            go.Scatter(
+                x=trend_x,
+                y=fit_excl[0] * trend_x + fit_excl[1],
+                mode="lines",
+                line=dict(color=INK, width=2),
+                showlegend=False,
+            ),
+            row=1,
+            col=2,
+        )
+        for col, fit in [(1, fit_incl), (2, fit_excl)]:
+            fig_cmp.add_annotation(
+                text=f"r = {fit[2]:.2f}<br>기울기 = {fit[0]:.3f}",
+                xref="x domain",
+                yref="y domain",
+                x=0.98,
+                y=0.98,
+                showarrow=False,
+                align="right",
+                font=dict(size=13, color=INK),
+                bgcolor="rgba(255,255,255,0.75)",
+                row=1,
+                col=col,
+            )
+        fig_cmp.update_xaxes(range=x_range, title_text="월평균 초과근무 시간(h)")
+        fig_cmp.update_yaxes(range=y_range, title_text="CSAT 평균", col=1)
+        fig_cmp.update_layout(
+            font=dict(family="Malgun Gothic"),
+            title=dict(text=f"이상치(초과근무 {OUTLIER_THRESHOLD}h+) 포함 vs 제외 — {selected_team}", x=0.02),
+            plot_bgcolor="white",
+            legend=dict(orientation="h", yanchor="bottom", y=1.1, xanchor="left", x=0),
+            margin=dict(t=110, b=50, l=50, r=30),
+        )
+        st.plotly_chart(fig_cmp, use_container_width=True)
+        if not is_outlier.any():
+            st.caption(f"{selected_team}에는 초과근무 {OUTLIER_THRESHOLD}시간 이상 상담원이 없어 두 패널의 결과가 동일합니다.")
+    else:
+        st.caption(f"{selected_team}은 표본이 너무 적어 이상치 비교를 계산할 수 없습니다.")
